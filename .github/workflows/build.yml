@@ -1,0 +1,82 @@
+name: build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pinned upstream
+        id: up
+        run: |
+          set -euo pipefail
+          . ./UPSTREAM
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "features=$FEATURES" >> "$GITHUB_OUTPUT"
+          case ",$FEATURES," in
+            *,enterprise,*|*,private,*|*,no_auth,*|*,ee,*|*,ce,*|*,ce_core,*|*,ee_core,*)
+              echo "forbidden feature in FEATURES"; exit 1 ;;
+          esac
+          owner=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${owner}/windmill-oss:${TAG}-oss.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune -af >/dev/null || true
+          df -h /
+
+      - name: Add swap
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 8G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -g
+
+      - name: Check out upstream at pinned commit
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/windmill-labs/windmill.git upstream
+          cd upstream
+          git fetch --depth 1 origin "refs/tags/${{ steps.up.outputs.tag }}:refs/tags/${{ steps.up.outputs.tag }}"
+          actual=$(git rev-list -n1 "${{ steps.up.outputs.tag }}")
+          [ "$actual" = "${{ steps.up.outputs.commit }}" ] || { echo "tag moved: $actual"; exit 1; }
+          git checkout -q "${{ steps.up.outputs.commit }}"
+
+      - name: Build image (upstream Dockerfile, unchanged)
+        working-directory: upstream
+        run: |
+          docker buildx build \
+            --build-arg features="${{ steps.up.outputs.features }}" \
+            --label org.opencontainers.image.source=https://github.com/${{ github.repository }} \
+            --label org.opencontainers.image.revision=${{ steps.up.outputs.commit }} \
+            --label org.opencontainers.image.version=${{ steps.up.outputs.tag }} \
+            --load -t "${{ steps.up.outputs.image }}" .
+
+      - name: Smoke test
+        run: bash ./smoke-test.sh "${{ steps.up.outputs.image }}" "${{ steps.up.outputs.tag }}"
+
+      - name: Push to GHCR
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "${{ steps.up.outputs.image }}"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "${{ steps.up.outputs.image }}")
+          echo "image: ${{ steps.up.outputs.image }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "digest: ${digest}" >> "$GITHUB_STEP_SUMMARY"
+          echo "${digest}"
